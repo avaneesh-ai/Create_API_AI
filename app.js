@@ -245,7 +245,7 @@
       : `${model}: `;
 
     if (lower.includes("backend") || lower.includes("protect") || lower.includes("safe")) {
-      return `${prefix}Use the backend proxy flow: store only key hashes, verify the Bearer key on /api/messages, then forward the model and messages to the Create_AI chatbot without adding email, name, or mobile.`;
+      return `${prefix}Use the backend proxy flow: create a server-verifiable key, verify the Bearer key on /api/messages, then forward the model and messages to the Create_AI chatbot without adding email, name, or mobile.`;
     }
 
     if (lower.includes("code") || lower.includes("curl") || lower.includes("example")) {
@@ -536,7 +536,7 @@
     const disabled = hasKey ? "" : "disabled";
     const keySource =
       state.apiKeySource === "server"
-        ? "Server-created key. Stored server-side as a hash and used to authorize the chatbot proxy."
+        ? "Server-created key. It authorizes the chatbot proxy before requests reach Create_AI."
         : state.apiKeySource === "browser"
           ? "Preview key. Start the Create_AI_API server to validate keys before chatbot access."
           : "Creating a Create_AI_API key.";
@@ -609,7 +609,7 @@
         <ul class="backend-list" aria-label="Production backend requirements">
           <li>Use bcrypt, argon2, or scrypt for passwords.</li>
           <li>Encrypt personal data at rest.</li>
-          <li>Store only API key hashes and reveal the key once. This local server does that in memory.</li>
+          <li>Use signed self-verifying keys on Vercel, or store only API key hashes when using a database.</li>
           <li>Use HTTPS, secure cookies, rate limits, and clean logs.</li>
         </ul>
       </section>
