@@ -4,6 +4,9 @@
   const CREATE_AI_CHATBOT_URL = "https://create-pied.vercel.app/api/messages";
   const LOCAL_SERVER_ORIGIN = "http://127.0.0.1:4174";
   const IDLE_MS = 2 * 60 * 1000;
+  const SAVED_PROFILE_KEY = "createAIAPI:savedProfile";
+  const SAVED_PROFILE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+  const PIN_DERIVE_ITERATIONS = 120000;
 
   const models = [
     { id: "qwen3.5:cloud", label: "Qwen3.5 Cloud" },
@@ -21,11 +24,18 @@
 
   const stepOrder = ["account", "profile", "emailSent", "confirm"];
   let passwordScratch = "";
+  let rememberPinScratch = "";
+  let unlockPinScratch = "";
+  let deferredInstallPrompt = null;
   let idleTimer = null;
   let toastTimer = null;
 
   const createInitialState = () => ({
     step: "account",
+    savedProfile: null,
+    rememberDevice: true,
+    installReady: false,
+    installed: window.matchMedia?.("(display-mode: standalone)")?.matches || navigator.standalone === true,
     account: { email: "" },
     profile: { name: "", mobile: "" },
     apiKey: "",
@@ -66,6 +76,8 @@
       '<svg class="svg-icon" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>',
     logout:
       '<svg class="svg-icon" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg>',
+    install:
+      '<svg class="svg-icon" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>',
     refresh:
       '<svg class="svg-icon" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 1-14.8 6.9"/><path d="M3 12A9 9 0 0 1 17.8 5.1"/><path d="M21 3v6h-6"/><path d="M3 21v-6h6"/></svg>',
     send:
@@ -83,6 +95,140 @@
       .replace(/>/g, "&gt;")
       .replace(/"/g, "&quot;")
       .replace(/'/g, "&#039;");
+  }
+
+  function bytesToBase64(bytes) {
+    let binary = "";
+    bytes.forEach((byte) => {
+      binary += String.fromCharCode(byte);
+    });
+    return btoa(binary);
+  }
+
+  function base64ToBytes(value) {
+    const binary = atob(value);
+    return Uint8Array.from(binary, (char) => char.charCodeAt(0));
+  }
+
+  async function derivePinKey(pin, salt) {
+    const material = await crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode(pin),
+      "PBKDF2",
+      false,
+      ["deriveKey"]
+    );
+
+    return crypto.subtle.deriveKey(
+      {
+        name: "PBKDF2",
+        salt,
+        iterations: PIN_DERIVE_ITERATIONS,
+        hash: "SHA-256"
+      },
+      material,
+      { name: "AES-GCM", length: 256 },
+      false,
+      ["encrypt", "decrypt"]
+    );
+  }
+
+  function getSavedProfileMeta() {
+    try {
+      const raw = localStorage.getItem(SAVED_PROFILE_KEY);
+      if (!raw) return null;
+
+      const saved = JSON.parse(raw);
+
+      if (!saved.expiresAt || Date.now() > saved.expiresAt) {
+        localStorage.removeItem(SAVED_PROFILE_KEY);
+        return null;
+      }
+
+      return {
+        savedAt: saved.savedAt,
+        expiresAt: saved.expiresAt,
+        label: saved.label || "saved profile"
+      };
+    } catch {
+      localStorage.removeItem(SAVED_PROFILE_KEY);
+      return null;
+    }
+  }
+
+  function clearSavedProfile() {
+    localStorage.removeItem(SAVED_PROFILE_KEY);
+    state.savedProfile = null;
+  }
+
+  async function saveRememberedProfile(pin) {
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const key = await derivePinKey(pin, salt);
+    const payload = {
+      account: { email: state.account.email },
+      profile: { name: state.profile.name, mobile: state.profile.mobile },
+      savedAt: Date.now()
+    };
+    const encrypted = await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv },
+      key,
+      new TextEncoder().encode(JSON.stringify(payload))
+    );
+    const record = {
+      version: 1,
+      label: maskEmail(state.account.email),
+      savedAt: Date.now(),
+      expiresAt: Date.now() + SAVED_PROFILE_TTL_MS,
+      salt: bytesToBase64(salt),
+      iv: bytesToBase64(iv),
+      data: bytesToBase64(new Uint8Array(encrypted))
+    };
+
+    localStorage.setItem(SAVED_PROFILE_KEY, JSON.stringify(record));
+    state.savedProfile = getSavedProfileMeta();
+  }
+
+  async function unlockRememberedProfile(pin) {
+    const raw = localStorage.getItem(SAVED_PROFILE_KEY);
+    if (!raw) {
+      throw new Error("No saved profile found.");
+    }
+
+    const saved = JSON.parse(raw);
+
+    if (!saved.expiresAt || Date.now() > saved.expiresAt) {
+      clearSavedProfile();
+      throw new Error("Saved profile expired.");
+    }
+
+    const key = await derivePinKey(pin, base64ToBytes(saved.salt));
+    const decrypted = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: base64ToBytes(saved.iv) },
+      key,
+      base64ToBytes(saved.data)
+    );
+    const payload = JSON.parse(new TextDecoder().decode(decrypted));
+
+    if (!payload?.account?.email || !payload?.profile?.name || !payload?.profile?.mobile) {
+      throw new Error("Saved profile is incomplete.");
+    }
+
+    return {
+      account: { email: payload.account.email },
+      profile: { name: payload.profile.name, mobile: payload.profile.mobile }
+    };
+  }
+
+  function wipePins() {
+    rememberPinScratch = "";
+    unlockPinScratch = "";
+    const rememberPin = document.getElementById("rememberPin");
+    const unlockPin = document.getElementById("unlockPin");
+    const savedPin = document.getElementById("savedPin");
+    if (rememberPin) rememberPin.value = "";
+    if (unlockPin) unlockPin.value = "";
+    if (savedPin) savedPin.value = "";
   }
 
   function wipePassword() {
@@ -138,6 +284,19 @@
   function renderLogoMark(label = "") {
     const alt = label ? ` alt="${escapeHtml(label)}"` : ' alt=""';
     return `<div class="logo-mark"><img src="./create-ai-logo.png"${alt} /></div>`;
+  }
+
+  function renderInstallButton(kind = "small") {
+    if (state.installed) {
+      return `<span class="install-badge">${icons.check} Installed</span>`;
+    }
+
+    return `
+      <button class="button ${kind === "icon" ? "icon" : "small"}" type="button" id="installApp" title="Install Create_AI_API">
+        ${icons.install}
+        ${kind === "icon" ? '<span class="sr-only">Install app</span>' : "Install app"}
+      </button>
+    `;
   }
 
   function maskKey(key) {
@@ -344,10 +503,17 @@
     return text;
   }
 
-  function clearSensitiveState() {
+  function clearSensitiveState({ forgetSaved = false } = {}) {
     wipePassword();
+    wipePins();
     clearTimeout(idleTimer);
+    const savedProfile = forgetSaved ? null : state.savedProfile;
+    if (forgetSaved) {
+      clearSavedProfile();
+    }
     state = createInitialState();
+    state.savedProfile = savedProfile || getSavedProfileMeta();
+    state.step = state.savedProfile ? "saved" : "account";
   }
 
   function armIdleLock() {
@@ -369,6 +535,47 @@
   ["pointerdown", "keydown", "input", "scroll", "mousemove", "touchstart"].forEach((eventName) => {
     document.addEventListener(eventName, noteActivity, { passive: true });
   });
+
+  if ("serviceWorker" in navigator && window.location.protocol !== "file:") {
+    window.addEventListener("load", () => {
+      navigator.serviceWorker.register("/service-worker.js").catch(() => {
+        showToast("Install support is not available in this browser.");
+      });
+    });
+  }
+
+  window.addEventListener("beforeinstallprompt", (event) => {
+    event.preventDefault();
+    deferredInstallPrompt = event;
+    state.installReady = true;
+    render();
+  });
+
+  window.addEventListener("appinstalled", () => {
+    deferredInstallPrompt = null;
+    state.installReady = false;
+    state.installed = true;
+    showToast("Create_AI_API installed.");
+    render();
+  });
+
+  async function installApp() {
+    if (state.installed) {
+      showToast("Create_AI_API is already installed.");
+      return;
+    }
+
+    if (!deferredInstallPrompt) {
+      showToast("Use your browser menu to add Create_AI_API to your home screen.");
+      return;
+    }
+
+    deferredInstallPrompt.prompt();
+    await deferredInstallPrompt.userChoice.catch(() => null);
+    deferredInstallPrompt = null;
+    state.installReady = false;
+    render();
+  }
 
   function renderBrandPanel() {
     return `
@@ -392,6 +599,10 @@
           <li><span class="trust-icon">${icons.key}</span><span>Generated keys unlock the Create_AI chatbot proxy.</span></li>
           <li><span class="trust-icon">${icons.lock}</span><span>Idle sessions lock after two minutes.</span></li>
         </ul>
+
+        <div class="install-row">
+          ${renderInstallButton()}
+        </div>
       </aside>
     `;
   }
@@ -404,6 +615,41 @@
           .map((_, index) => `<span class="step-dot ${index <= current ? "active" : ""}"></span>`)
           .join("")}
       </div>
+    `;
+  }
+
+  function renderSavedStep() {
+    const label = state.savedProfile?.label || "saved profile";
+
+    return `
+      <div class="flow-header">
+        <div>
+          <h2 class="flow-title">Welcome back</h2>
+          <p class="flow-copy">Unlock the saved Create_AI_API profile on this device. The saved details are encrypted and the password was never stored.</p>
+        </div>
+      </div>
+
+      <form class="form-stack" id="savedForm" novalidate>
+        <div class="saved-profile-box">
+          <span class="status-dot">${icons.lock}</span>
+          <div>
+            <strong>${escapeHtml(label)}</strong>
+            <p>Only a masked label is visible until the device PIN is entered.</p>
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="savedPin">Device PIN</label>
+          <input id="savedPin" type="password" inputmode="numeric" autocomplete="off" placeholder="Enter your PIN" />
+          <div class="error-text" id="savedPinError"></div>
+        </div>
+
+        <div class="actions-row">
+          <button class="button primary" type="submit">Unlock ${icons.lock}</button>
+          <button class="button ghost" type="button" id="newLogin">Use another account</button>
+          <button class="button danger" type="button" id="forgetSaved">Forget saved details</button>
+        </div>
+      </form>
     `;
   }
 
@@ -458,6 +704,17 @@
           <label for="mobile">Mobile number</label>
           <input id="mobile" type="tel" autocomplete="tel" value="${escapeHtml(state.profile.mobile)}" placeholder="+91 98765 43210" />
           <div class="error-text" id="mobileError"></div>
+        </div>
+
+        <label class="check-row" for="rememberDevice">
+          <input id="rememberDevice" type="checkbox" ${state.rememberDevice ? "checked" : ""} />
+          <span>Remember this device with an encrypted local profile</span>
+        </label>
+
+        <div class="field remember-pin-field ${state.rememberDevice ? "" : "hidden"}">
+          <label for="rememberPin">Device unlock PIN</label>
+          <input id="rememberPin" type="password" inputmode="numeric" autocomplete="off" value="${escapeHtml(rememberPinScratch)}" placeholder="At least 4 digits" />
+          <div class="error-text" id="rememberPinError"></div>
         </div>
 
         <div class="actions-row">
@@ -517,6 +774,7 @@
 
   function renderFlowPanel() {
     const steps = {
+      saved: renderSavedStep,
       account: renderAccountStep,
       profile: renderProfileStep,
       emailSent: renderEmailSentStep,
@@ -695,6 +953,7 @@
             </div>
           </div>
           <div class="header-actions">
+            ${renderInstallButton("icon")}
             <button class="button icon" type="button" id="lockNow" title="Lock session">${icons.lock}<span class="sr-only">Lock session</span></button>
             <button class="button icon" type="button" id="logout" title="Log out">${icons.logout}<span class="sr-only">Log out</span></button>
           </div>
@@ -717,6 +976,27 @@
   }
 
   function renderLockOverlay() {
+    const unlockControls = state.savedProfile
+      ? `
+          <form class="form-stack" id="lockForm" novalidate>
+            <div class="field">
+              <label for="unlockPin">Device PIN</label>
+              <input id="unlockPin" type="password" inputmode="numeric" autocomplete="off" placeholder="Enter your PIN" />
+              <div class="error-text" id="unlockPinError"></div>
+            </div>
+            <div class="modal-actions">
+              <button class="button primary" type="submit">${icons.lock} Unlock workspace</button>
+              <button class="button danger" type="button" id="lockedLogout">${icons.logout} Log out</button>
+            </div>
+          </form>
+        `
+      : `
+          <div class="modal-actions">
+            <button class="button primary" type="button" id="unlock">${icons.lock} Unlock workspace</button>
+            <button class="button danger" type="button" id="lockedLogout">${icons.logout} Log out</button>
+          </div>
+        `;
+
     return `
       <div class="screen" role="dialog" aria-modal="true" aria-labelledby="lockTitle">
         <div class="lock-panel">
@@ -728,25 +1008,27 @@
             </div>
           </div>
           <h2 id="lockTitle">Session locked</h2>
-          <p>The workspace is covered for ${escapeHtml(maskEmail(state.account.email))}. A production app would re-check the server session here.</p>
-          <div class="modal-actions">
-            <button class="button primary" type="button" id="unlock">${icons.lock} Unlock workspace</button>
-            <button class="button danger" type="button" id="lockedLogout">${icons.logout} Log out</button>
-          </div>
+          <p>The workspace is covered for ${escapeHtml(maskEmail(state.account.email))}. ${state.savedProfile ? "Enter the device PIN to reveal saved details again." : "Resume to continue."}</p>
+          ${unlockControls}
         </div>
       </div>
     `;
   }
 
   function renderLogoutModal() {
+    const savedCopy = state.savedProfile
+      ? "Your encrypted saved profile will stay on this device unless you choose forget."
+      : "No saved profile is stored on this device.";
+
     return `
       <div class="screen" role="dialog" aria-modal="true" aria-labelledby="logoutTitle">
         <div class="modal-panel">
           <h2 id="logoutTitle">Log out?</h2>
-          <p>This will clear local details for ${escapeHtml(maskEmail(state.account.email))}, remove the API key, and wipe chat history.</p>
+          <p>This will clear the visible session for ${escapeHtml(maskEmail(state.account.email))}, remove the API key, and wipe chat history. ${savedCopy}</p>
           <div class="modal-actions">
             <button class="button ghost" type="button" id="cancelLogout">Cancel</button>
-            <button class="button danger" type="button" id="confirmLogout">${icons.logout} Log out and wipe</button>
+            <button class="button danger" type="button" id="confirmLogout">${icons.logout} Log out</button>
+            ${state.savedProfile ? `<button class="button danger" type="button" id="forgetDevice">${icons.lock} Forget saved details</button>` : ""}
           </div>
         </div>
       </div>
@@ -766,6 +1048,59 @@
   }
 
   function bindEvents() {
+    document.querySelectorAll("#installApp").forEach((button) => {
+      button.addEventListener("click", installApp);
+    });
+
+    const savedForm = document.getElementById("savedForm");
+    if (savedForm) {
+      const savedPinInput = document.getElementById("savedPin");
+
+      savedPinInput?.addEventListener("input", () => {
+        unlockPinScratch = savedPinInput.value;
+      });
+
+      savedForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const pin = savedPinInput?.value || unlockPinScratch;
+        const error = document.getElementById("savedPinError");
+
+        if (!/^\d{4,12}$/.test(pin)) {
+          error.textContent = "Enter your 4 to 12 digit device PIN.";
+          return;
+        }
+
+        try {
+          const unlocked = await unlockRememberedProfile(pin);
+          state.account = unlocked.account;
+          state.profile = unlocked.profile;
+          state.step = "workspace";
+          state.locked = false;
+          wipePins();
+          await provisionApiKey();
+          render();
+        } catch {
+          error.textContent = "That PIN did not unlock the saved profile.";
+          unlockPinScratch = "";
+          if (savedPinInput) savedPinInput.value = "";
+        }
+      });
+
+      document.getElementById("newLogin")?.addEventListener("click", () => {
+        wipePins();
+        state.step = "account";
+        render();
+      });
+
+      document.getElementById("forgetSaved")?.addEventListener("click", () => {
+        clearSavedProfile();
+        wipePins();
+        state.step = "account";
+        showToast("Saved profile removed from this device.");
+        render();
+      });
+    }
+
     const accountForm = document.getElementById("accountForm");
     if (accountForm) {
       const emailInput = document.getElementById("email");
@@ -804,6 +1139,8 @@
     if (profileForm) {
       const nameInput = document.getElementById("name");
       const mobileInput = document.getElementById("mobile");
+      const rememberInput = document.getElementById("rememberDevice");
+      const rememberPinInput = document.getElementById("rememberPin");
 
       nameInput?.addEventListener("input", () => {
         state.profile.name = nameInput.value.trimStart();
@@ -813,7 +1150,20 @@
         state.profile.mobile = mobileInput.value;
       });
 
+      rememberInput?.addEventListener("change", () => {
+        state.rememberDevice = rememberInput.checked;
+        if (!state.rememberDevice) {
+          rememberPinScratch = "";
+        }
+        render();
+      });
+
+      rememberPinInput?.addEventListener("input", () => {
+        rememberPinScratch = rememberPinInput.value;
+      });
+
       document.getElementById("backToAccount")?.addEventListener("click", () => {
+        wipePins();
         state.step = "account";
         render();
       });
@@ -823,15 +1173,20 @@
         const name = nameInput.value.trim();
         const mobile = normalizeMobile(mobileInput.value.trim());
         const digits = mobile.replace(/\D/g, "");
+        const rememberPin = rememberPinInput?.value || rememberPinScratch;
         const nameOk = name.length >= 2;
         const mobileOk = digits.length >= 10 && digits.length <= 15;
+        const pinOk = !state.rememberDevice || /^\d{4,12}$/.test(rememberPin);
 
         document.getElementById("nameError").textContent = nameOk ? "" : "Enter at least 2 characters.";
         document.getElementById("mobileError").textContent = mobileOk
           ? ""
           : "Enter a valid 10 to 15 digit mobile number.";
+        document.getElementById("rememberPinError").textContent = pinOk
+          ? ""
+          : "Enter a 4 to 12 digit PIN for this device.";
 
-        if (!nameOk || !mobileOk) return;
+        if (!nameOk || !mobileOk || !pinOk) return;
 
         state.profile.name = name;
         state.profile.mobile = mobile;
@@ -858,6 +1213,16 @@
     document.getElementById("enterWorkspace")?.addEventListener("click", async () => {
       state.step = "workspace";
       state.locked = false;
+      if (state.rememberDevice && rememberPinScratch) {
+        try {
+          await saveRememberedProfile(rememberPinScratch);
+          showToast("Encrypted profile saved on this device.");
+        } catch {
+          showToast("Could not save profile on this device.");
+        } finally {
+          wipePins();
+        }
+      }
       await provisionApiKey();
       render();
     });
@@ -900,6 +1265,31 @@
       render();
     });
 
+    const lockForm = document.getElementById("lockForm");
+    lockForm?.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const input = document.getElementById("unlockPin");
+      const error = document.getElementById("unlockPinError");
+      const pin = input?.value || "";
+
+      if (!/^\d{4,12}$/.test(pin)) {
+        error.textContent = "Enter your 4 to 12 digit device PIN.";
+        return;
+      }
+
+      try {
+        const unlocked = await unlockRememberedProfile(pin);
+        state.account = unlocked.account;
+        state.profile = unlocked.profile;
+        state.locked = false;
+        wipePins();
+        render();
+      } catch {
+        error.textContent = "That PIN did not unlock the saved profile.";
+        if (input) input.value = "";
+      }
+    });
+
     document.getElementById("lockedLogout")?.addEventListener("click", () => {
       state.logoutOpen = true;
       state.locked = false;
@@ -913,7 +1303,13 @@
 
     document.getElementById("confirmLogout")?.addEventListener("click", () => {
       clearSensitiveState();
-      showToast("Local session wiped.");
+      showToast("Current session wiped.");
+      render();
+    });
+
+    document.getElementById("forgetDevice")?.addEventListener("click", () => {
+      clearSensitiveState({ forgetSaved: true });
+      showToast("Saved details removed from this device.");
       render();
     });
 
@@ -964,6 +1360,11 @@
       state.chatBusy = false;
       render();
     });
+  }
+
+  state.savedProfile = getSavedProfileMeta();
+  if (state.savedProfile) {
+    state.step = "saved";
   }
 
   render();

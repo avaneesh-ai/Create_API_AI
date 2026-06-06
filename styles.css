@@ -204,6 +204,25 @@ button {
   font-size: 0.9rem;
 }
 
+.install-row {
+  margin-top: 14px;
+  display: flex;
+}
+
+.install-badge {
+  min-height: 36px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--mint);
+  background: rgba(44, 124, 102, 0.12);
+  border: 1px solid rgba(44, 124, 102, 0.18);
+  border-radius: 8px;
+  padding: 0 12px;
+  font-size: 0.86rem;
+  font-weight: 850;
+}
+
 .trust-icon {
   width: 24px;
   height: 24px;
@@ -258,9 +277,54 @@ button {
   margin-top: 6px;
 }
 
+.hidden {
+  display: none !important;
+}
+
 .field {
   display: grid;
   gap: 7px;
+}
+
+.check-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  color: var(--muted);
+  line-height: 1.45;
+  font-size: 0.9rem;
+}
+
+.check-row input {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 18px;
+  margin-top: 1px;
+  accent-color: var(--brand);
+}
+
+.saved-profile-box {
+  display: grid;
+  grid-template-columns: 24px 1fr;
+  gap: 10px;
+  align-items: start;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 250, 244, 0.72);
+  padding: 14px;
+}
+
+.saved-profile-box strong {
+  display: block;
+  color: var(--ink);
+  margin-bottom: 3px;
+}
+
+.saved-profile-box p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.45;
+  font-size: 0.86rem;
 }
 
 .field label,
